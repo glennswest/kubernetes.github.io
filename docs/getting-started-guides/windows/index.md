@@ -65,7 +65,7 @@ The following diagram gives a general overview of the architecture and interacti
 
 (The above image is from [https://github.com/openvswitch/ovn-kubernetes#overlay-mode-architecture-diagram](https://github.com/openvswitch/ovn-kubernetes#overlay-mode-architecture-diagram))
 
-Due to its architecture, OVN has a central component which stores your networking intent in a database. Other components i.e. kube-apiserver, kube-controller-manager, kube-scheduler etc. can be deployed on that central node as well.
+Due to its architecture, OVN has a central component which stores your networking intent in a database managed by OVS. Other components i.e. kube-apiserver, kube-controller-manager, kube-scheduler etc. can be deployed on that central node as well.
 
 ## Setting up Windows Server Containers on Kubernetes
 To run Windows Server Containers on Kubernetes, you'll need to set up both your host machines and the Kubernetes node components for Windows. Depending on your network topology, routes may need to be set up for pod communication on different nodes.
@@ -150,16 +150,16 @@ Note: this file assumes that a user previous created 'l2bridge' host networks on
 
 ##### Linux Host Setup
 
-Setting up the central node and the components needed is out of scope of this document. You can read [these instructions](https://github.com/openvswitch/ovn-kubernetes#k8s-master-node-initialization) for that.
+Setting up the central node and the components needed is out of scope of this document. You can read [these instructions](https://github.com/openvswitch/ovn-kubernetes#master-node-initialization) for that.
 
-Adding a Linux minion is also out of scope and you can read it here: [Linux minion](https://github.com/openvswitch/ovn-kubernetes#k8s-minion-node-initializations).
+Adding a Linux minion is also out of scope and you can read it here: [Linux minion](https://github.com/openvswitch/ovn-kubernetes#minion-node-initialization).
 
 
 ##### Windows Host Setup
 
-Adding a Windows minion requires you to install OVS and OVN binaries. Windows Server container host running the required Windows Server and Docker versions. Follow the setup instructions outlined by [this help topic](https://docs.microsoft.com/en-us/virtualization/windowscontainers/quick-start/quick-start-windows-server). This type of deployment is supported starting with Windows Server 2016 RTM.
+The steps that are following assume that the Windows Server has Docker already installed. Follow the setup instructions outlined by [this help topic](https://docs.microsoft.com/en-us/virtualization/windowscontainers/quick-start/quick-start-windows-server). This type of deployment is supported starting with Windows Server 2016 RTM.
 
-Compiling OVS and generating the installer will not be treated in this document. For a step by step instruction please visit [this link](http://docs.openvswitch.org/en/latest/intro/install/windows/#open-vswitch-on-windows).
+Adding a Windows minion requires you to install OVS and OVN binaries. Compiling OVS and generating the installer will not be treated in this document. For a step by step instruction please visit [this link](http://docs.openvswitch.org/en/latest/intro/install/windows/#open-vswitch-on-windows).
 For a prebuilt certified installer please visit [this link](https://cloudbase.it/openvswitch/#download) and download the latest version of it.
 
 The following guide uses the prebuilt certified installer.
@@ -173,49 +173,116 @@ For an unattended installation please use the following command:
 cmd /c 'msiexec /i openvswitch.msi ADDLOCAL="OpenvSwitchCLI,OpenvSwitchDriver,OVNHost" /qn'
 ```
 
-The installer propagates new environment variables. Please open a new command shell or logoff/logon to ensure the environment variables are refreshed.
+The installer propagates new environment variables. Please open a new command shell or logoff/logon to ensure the environment variables are refreshed. Make sure that the environment variables are refreshed by running the following command:
+```
+ovs-vsctl --version
+```
 
 For overlay, OVS on Windows requires a transparent docker network to function properly. Please use the following to create a transparent docker network which will be used by OVS. From powershell:
 ```
 docker network create -d transparent --gateway $GATEWAY_IP --subnet $SUBNET `
     -o com.docker.network.windowsshim.interface="$INTERFACE_ALIAS" external
 ```
-Where $SUBNET is the minion subnet which will be used to spawn pods on (the one which will be used by kubernetes), $GATEWAY_IP is the first IP of the $SUBNET and $INTERFACE_ALIAS is the interface used for creating the overlay tunnels (must have connectivity with the rests of the OVN hosts).
+Where $INTERFACE_ALIAS is the interface used for creating the overlay tunnels (must have connectivity with the rests of the OVN hosts). The variables $SUBNET and $GATEWAY_IP are explained below how they can be fetched.
+
+The subnets for each minion node will be assigned automatically by OVN. This requires the Windows node to get registered in Kubernetes in order to be assigned a POD subnet. Please start the kubelet and wait until the node gets registered.
+
+As an example, to register the node "windows-minion", start kubelet and look in the output for the following log message "Successfully registered node windows-minion". To run kubelet only for node registration you can execute:
+```
+kubelet.exe --hostname-override="windows-minion" --kubeconfig="C:\\kubeconfig.yaml"
+```
+After the node is registered, you can stop the kubelet. To fetch the $SUBNET to create the docker network, please run:
+```
+$ kubectl describe node "windows-minion" | grep ovn_host_subnet
+                    ovn_host_subnet=10.0.1.0/24
+```
+This tells us that for docker network connect we should use $SUBNET="10.0.1.0/24" and $GATEWAY_IP="10.0.1.1".
+
+**Note:** if the node does not have the "ovn_host_subnet", please make sure that the [master has been properly initialized](https://github.com/openvswitch/ovn-kubernetes#master-node-initialization) and that ovnkube is running in the background.
+
 Example:
 ```
 docker network create -d transparent --gateway 10.0.1.1 --subnet 10.0.1.0/24 `
     -o com.docker.network.windowsshim.interface="Ethernet0" external
 ```
-After creating the docker network please run the next commands from powershell. (creates an OVS bridge, adds the interface under the bridge and enables the OVS forwarding switch extension)
+After creating the docker network please run the next commands from powershell corresponding to the Windows Server version that you are running. (creates an OVS bridge, adds the interface under the bridge and enables the OVS forwarding switch extension). In both cases, replace the value of $INTERFACE_ALIAS with the one corresponding to your environment.
+
+**Note:** make sure to create a powershell script with the following commands, the internet connectivity might drop shortly while the script is executing.
+
+On Windows Server RTM, please run:
 ```
+$INTERFACE_ALIAS="<replace_me>"
 $a = Get-NetAdapter | where Name -Match HNSTransparent
 Rename-NetAdapter $a[0].Name -NewName HNSTransparent
 Stop-Service ovs-vswitchd -force; Disable-VMSwitchExtension "Cloudbase Open vSwitch Extension";
 ovs-vsctl --no-wait del-br br-ex
 ovs-vsctl --no-wait --may-exist add-br br-ex
 ovs-vsctl --no-wait add-port br-ex HNSTransparent -- set interface HNSTransparent type=internal
-ovs-vsctl --no-wait add-port br-ex $INTERFACE_ALIAS
+ovs-vsctl --no-wait add-port br-ex '$INTERFACE_ALIAS'
 Enable-VMSwitchExtension "Cloudbase Open vSwitch Extension"; sleep 2; Restart-Service ovs-vswitchd
 ```
-Besides of the above, setting up a Windows host is the same as the Linux host. Follow the steps from [here](https://github.com/openvswitch/ovn-kubernetes#k8s-minion-node-initializations).
 
-**Windows CNI Setup**
+On Windows Server version 1709 and above, please run:
+```
+$INTERFACE_ALIAS="<replace_me>"
+Stop-Service ovs-vswitchd -force; Get-VMSwitch -SwitchType External | Disable-VMSwitchExtension "Cloudbase Open vSwitch Extension"
+Get-VMSwitch -SwitchType External | Set-VMSwitch -AllowManagementOS $false
+# Ignore the error from the first command
+Get-VMSwitch -SwitchType External | Set-VMSwitch -AllowManagementOS $false
+ovs-vsctl --no-wait --may-exist add-br br-ex
+ovs-vsctl --no-wait add-port br-ex '$INTERFACE_ALIAS'
+Get-VMSwitch -SwitchType External | Enable-VMSwitchExtension "Cloudbase Open vSwitch Extension"; sleep 2; Restart-Service ovs-vswitchd
+# Clone the MAC Address of $INTERFACE_ALIAS on br-ex
+$MAC_ADDRESS=$(Get-NetAdapter "$INTERFACE_ALIAS").MacAddress
+$FAKE_MAC_ADDRESS=$MAC_ADDRESS.Substring(0,15)+"99"
+Set-NetAdapter -Name "$INTERFACE_ALIAS" -MacAddress $FAKE_MAC_ADDRESS -Confirm:$false
+Set-NetAdapter -Name br-ex -MacAddress $MAC_ADDRESS -Confirm:$false
+# br-ex will get all the interface details from the DHCP server now
+Enable-NetAdapter br-ex
+```
+The node will require an unique system-id which will be used in OVS. To generate a new GUID please run the following from powershell:
+```
+$GUID = (New-Guid).Guid
+ovs-vsctl set Open_vSwitch . external_ids:system-id="$($GUID)"
+```
+Initializing the Windows Server minion node is similar to the Linux process described [here](https://github.com/openvswitch/ovn-kubernetes#minion-node-initialization).
 
-Today, Windows OVN&OVS CNI plugin is based on ovn_cni.exe which can be downloaded from [here](https://cloudbase.it/downloads/ovn_cni.exe). A sample of CNI config file is the following:
+To get the latest Windows version of ovnkube and the CNI plugin, follow the steps described [here](https://github.com/openvswitch/ovn-kubernetes/tree/master/go-controller#build). Copy ovnkube.exe and ovn-k8s-cni-overlay.exe on the Windows minion nodes. The following guide assumes that the binaries have been copied to "C:\cni" folder.
+
+The hosts file needs to be updated with the IP which will be used to create the tunnel between the nodes. Make sure that the host is reachable by other hosts via that IP. To update the hosts file, please run from powershell:
 ```
-{
-    "name": "net",
-    "type": "ovn_cni.exe",
-    "bridge": "br-int",
-    "isGateway": "true",
-    "ipMasq": "false",
-    "ipam": {
-         "type": "host-local",
-         "subnet": "$SUBNET"
-         }
-}
+$IP_ADDRESS="<replace_me>"
+$HOSTNAME=hostname
+Add-Content C:\Windows\System32\drivers\etc\hosts "`r`n$IP_ADDRESS $HOSTNAME"
 ```
-Where $SUBNET is the subnet that was used in the previous ```docker network create``` command.
+The node is ready for initialization with ovnkube now. This can be done with the following command from powershell:
+```
+ovnkube.exe -k8s-kubeconfig=C:\\kubeconfig.yaml `
+	-k8s-apiserver http://$MASTER_IP:8080 `
+	-init-node $NODE_NAME `
+	-k8s-token $K8S_TOKEN `
+	-nb-address "tcp://$MASTER_IP:6641" `
+	-sb-address "tcp://$MASTER_IP:6642" `
+	-cluster-subnet $CLUSTER_SUBNET `
+	-cni-conf-dir="$CNI_CONF_DIR" `
+	-service-cluster-ip-range=$SERVICE_CLUSTER_IP_RANGE
+```
+Where the variables are as follows:
+- $MASTER_IP is the IP of the master node
+- $NODE_NAME should be the same as the one used by kubelet
+- $CLUSTER_SUBNET should be the same as the one provided to ovnkube in the master node. (example: "10.0.0.0/16")
+- $CNI_CONF_DIR is the directory where ovnkube will generate the CNI config to be used by kubelet (example: "C:\cni")
+- $SERVICE_CLUSTER_IP_RANGE is the same as the one provided to k8s-apiserver via --service-cluster-ip-range option (example: "172.16.1.0/24")
+
+The node is not initialized and can be used in the kubernetes cluster. Example of kubelet command which uses OVN/OVS CNI plugin:
+```
+.\kubelet.exe --hostname-override="windows-minion" `
+	--resolv-conf="" `
+	--kubeconfig="C:/kubernetes\\kubeconfig.yaml" `
+	--network-plugin=cni `
+	--cni-bin-dir="C:\\cni" `
+	--cni-conf-dir="C:\\cni"
+```
 
 For a complete guide on Google Cloud Platform (GCP), namely Google Compute Engine (GCE) visit [this](https://github.com/apprenda/kubernetes-ovn-heterogeneous-cluster#heterogeneous-kubernetes-cluster-on-top-of-ovn).
 
